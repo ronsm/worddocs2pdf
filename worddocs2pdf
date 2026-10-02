@@ -1,0 +1,306 @@
+#!/bin/zsh
+#
+# worddocs2pdf — export Word documents to PDF via Microsoft Word, then merge them.
+#
+# Requires: Microsoft Word (AppleScript-enabled) and pdfunite (poppler).
+#
+# Word is sandboxed, so it prompts for permission whenever it reads or writes a
+# file outside its own container. To avoid a dialog per document, this script does
+# all of Word's work inside ~/Library/Containers/com.microsoft.Word/Data/tmp:
+# the shell (which is not sandboxed) copies each document in, Word converts it in
+# place, and the shell merges the results out to wherever you asked for them.
+#
+emulate -L zsh
+set -u
+setopt null_glob
+
+readonly PROG=${0:t}
+readonly WORD_APP="/Applications/Microsoft Word.app"
+readonly WORD_CONTAINER="$HOME/Library/Containers/com.microsoft.Word/Data"
+
+# ---------------------------------------------------------------- usage --
+
+usage() {
+  cat <<EOF
+$PROG — export Word documents to PDF with Microsoft Word, then merge into one PDF.
+
+REQUIRES
+  macOS, Microsoft Word installed at $WORD_APP, and pdfunite (brew install poppler).
+  Conversion is done by Word itself, so output matches Word's own Save As PDF.
+
+USAGE
+  $PROG [options] <folder>
+  $PROG [options] <file.docx> [file2.docx ...]
+
+  Documents are merged in natural filename order (so Doc2 precedes Doc10).
+  Word lock files (~\$*) and non-Word files are skipped.
+
+OPTIONS
+  -o FILE             Output path. Default: merged.pdf beside the input documents.
+  -f                  Overwrite FILE if it already exists.
+  --keep              Also save the per-document PDFs beside their source files.
+  --clear-quarantine  Strip com.apple.quarantine from the inputs first. Downloaded
+                      files carry this flag and Word may open them read-only in
+                      Protected View, which blocks PDF export.
+  --dry-run           Print the resolved merge order and exit without touching Word.
+  -h, --help          Show this help.
+
+FIRST RUN
+  macOS will ask "<your terminal> wants to control Microsoft Word". Click OK.
+  If you decline, exports fail with error -1743. Re-enable it at:
+    System Settings -> Privacy & Security -> Automation -> <your terminal> -> Microsoft Word
+
+NOTES
+  Your source documents are never modified, and no files are written next to them
+  unless you pass --keep. If Word was already running it is left running, with its
+  open documents untouched.
+EOF
+}
+
+die()  { print -ru2 -- "$PROG: $*"; exit 1; }
+warn() { print -ru2 -- "$PROG: $*"; }
+
+# ------------------------------------------------------- argument parsing --
+
+output=""
+force=0
+keep=0
+clear_quarantine=0
+dry_run=0
+inputs=()
+
+while (( $# )); do
+  case $1 in
+    -o)       (( $# >= 2 )) || die "-o needs a file path"; output=$2; shift 2 ;;
+    -o*)      output=${1#-o}; shift ;;
+    -f)       force=1; shift ;;
+    --keep)   keep=1; shift ;;
+    --clear-quarantine) clear_quarantine=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --)       shift; inputs+=("$@"); break ;;
+    -*)       die "unknown option: $1 (try --help)" ;;
+    *)        inputs+=("$1"); shift ;;
+  esac
+done
+
+(( ${#inputs} )) || { usage; exit 1; }
+
+[[ -d $WORD_APP ]] || die "Microsoft Word not found at $WORD_APP"
+(( $+commands[pdfunite] )) || die "pdfunite not found. Install it with: brew install poppler"
+
+# ------------------------------------------------------- collect the docs --
+
+# A convertible Word document: not a ~$ lock file, and a format Word can open.
+is_word_doc() {
+  local f=${1:t}
+  [[ $f == '~$'* ]] && return 1
+  [[ ${f:l} == *.(doc|docx|docm|dot|dotx|rtf|odt) ]]
+}
+
+docs=()
+if (( ${#inputs} == 1 )) && [[ -d ${inputs[1]} ]]; then
+  srcdir=${inputs[1]:A}
+  for f in $srcdir/*; do
+    [[ -f $f ]] && is_word_doc $f && docs+=($f)
+  done
+  (( ${#docs} )) || die "no Word documents found in ${inputs[1]}"
+else
+  for f in $inputs; do
+    [[ -e $f ]] || die "no such file: $f"
+    [[ -d $f ]] && die "pass either one folder or a list of files, not both"
+    if is_word_doc $f; then
+      docs+=(${f:A})
+    else
+      warn "skipping (not a Word document): $f"
+    fi
+  done
+  (( ${#docs} )) || die "none of the given files are Word documents"
+  srcdir=${docs[1]:h}
+fi
+
+# Natural filename order: Doc2 before Doc10.
+docs=(${(f)"$(print -rl -- $docs | sort -V)"})
+
+# ------------------------------------------------------------- output path --
+
+[[ -n $output ]] || output=$srcdir/merged.pdf
+output=${output:A}
+[[ ${output:l} == *.pdf ]] || output=$output.pdf
+[[ -d ${output:h} ]] || die "output directory does not exist: ${output:h}"
+if [[ -e $output ]] && (( ! force )); then
+  die "$output already exists (use -f to overwrite)"
+fi
+
+# ----------------------------------------------------------------- listing --
+
+print -r -- "Merge order (${#docs} document(s)) -> $output"
+integer i=0
+for d in $docs; do
+  printf '  %2d. %s\n' $(( ++i )) ${d:t}
+done
+
+if (( dry_run )); then
+  print -r -- "(dry run: nothing converted)"
+  exit 0
+fi
+
+# -------------------------------------------------------------- quarantine --
+
+quarantined=()
+for d in $docs; do
+  xattr "$d" 2>/dev/null | grep -q '^com.apple.quarantine$' && quarantined+=($d)
+done
+
+if (( ${#quarantined} )); then
+  if (( clear_quarantine )); then
+    print -r -- "Clearing com.apple.quarantine from ${#quarantined} file(s)."
+    for d in $quarantined; do xattr -d com.apple.quarantine "$d" 2>/dev/null; done
+  else
+    warn "${#quarantined} input file(s) are quarantined (downloaded from the internet)."
+    warn "Word may open these read-only in Protected View and refuse to export."
+    warn "If any file below fails, re-run with --clear-quarantine."
+  fi
+fi
+
+# -------------------------------------------------- Word's sandbox workspace --
+
+# Everything Word touches lives here, so it never asks permission for a file.
+if [[ -d $WORD_CONTAINER ]]; then
+  work=$WORD_CONTAINER/tmp/$PROG.$$
+else
+  # Non-sandboxed or never-launched Word: fall back to a normal temp dir and
+  # accept that Word may prompt for access.
+  warn "Word container not found; falling back to a temp directory."
+  warn "Word may ask permission for each file."
+  work=${TMPDIR:-/tmp}/$PROG.$$
+fi
+
+mkdir -p -- "$work" || die "could not create working directory: $work"
+
+word_was_running=0
+pgrep -qx "Microsoft Word" && word_was_running=1
+alerts_suppressed=0
+
+cleanup() {
+  if (( alerts_suppressed )); then
+    osascript -e 'tell application "Microsoft Word" to set display alerts to alerts all' 2>/dev/null
+  fi
+  (( word_was_running )) || osascript -e 'tell application "Microsoft Word" to quit saving no' 2>/dev/null
+  [[ -n ${work:-} && -d $work ]] && rm -rf -- "$work"
+}
+trap cleanup EXIT INT TERM
+
+# ------------------------------------------------------------ export loop --
+
+osascript -e 'tell application "Microsoft Word" to launch' 2>/dev/null \
+  || die "could not start Microsoft Word (see FIRST RUN in --help for Automation permission)"
+
+# Per-session property, defaults to "alerts all"; suppress Word's modal dialogs.
+if osascript -e 'tell application "Microsoft Word" to set display alerts to alerts none' >/dev/null 2>&1; then
+  alerts_suppressed=1
+fi
+
+# Convert one document. $1 = source (inside $work), $2 = destination .pdf.
+# Word's `open` returns no value, so the document is picked up as `active document`.
+export_one() {
+  osascript - "$1" "$2" <<'APPLESCRIPT' 2>&1
+on run argv
+  set inHFS to POSIX file (item 1 of argv) as text
+  set outHFS to POSIX file (item 2 of argv) as text
+  tell application "Microsoft Word"
+    with timeout of 600 seconds
+      open file name inHFS add to recent files no
+      set theDoc to active document
+      try
+        save as theDoc file name outHFS file format format PDF
+      on error errMsg number errNum
+        try
+          close theDoc saving no
+        end try
+        error errMsg number errNum
+      end try
+      close theDoc saving no
+    end timeout
+  end tell
+end run
+APPLESCRIPT
+}
+
+pdfs=()
+failed=()
+integer n=${#docs}
+i=0
+
+for d in $docs; do
+  (( ++i ))
+
+  # Copy into Word's container under an index-prefixed name, so merge order is
+  # explicit and two documents with the same basename cannot collide.
+  stem=$(printf '%04d_%s' $i "${d:t:r}")
+  src=$work/$stem.${d:e}
+  pdf=$work/$stem.pdf
+
+  printf '  [%d/%d] %-44s -> ' $i $n ${d:t}
+
+  if ! cp -- "$d" "$src" 2>/dev/null; then
+    print -r -- "FAILED"
+    failed+=("${d:t}: could not read the file")
+    continue
+  fi
+
+  if err=$(export_one "$src" "$pdf") && [[ -s $pdf ]]; then
+    print -r -- "${d:t:r}.pdf"
+    pdfs+=($pdf)
+  else
+    print -r -- "FAILED"
+    failed+=("${d:t}: ${err:-Word produced no output}")
+    rm -f -- "$pdf"
+  fi
+  rm -f -- "$src"
+done
+
+if (( ${#failed} )); then
+  print -ru2 -- ""
+  print -ru2 -- "$PROG: ${#failed} document(s) failed to convert:"
+  for f in $failed; do print -ru2 -- "  - $f"; done
+  (( ${#pdfs} )) || die "nothing was converted; no PDF written"
+  print -ru2 -- "Merging the ${#pdfs} document(s) that did convert."
+  print -ru2 -- ""
+fi
+
+# ------------------------------------------------------------------ merge --
+
+total_pages=""
+if (( $+commands[pdfinfo] )); then
+  integer sum=0 ok=1
+  for p in $pdfs; do
+    pc=$(pdfinfo "$p" 2>/dev/null | awk '/^Pages:/{print $2}')
+    [[ -n $pc ]] && (( sum += pc )) || ok=0
+  done
+  (( ok )) && total_pages=", $sum pages"
+fi
+
+print -r -- "  merging ${#pdfs} file(s)${total_pages} -> ${output:t}"
+pdfunite "${pdfs[@]}" "$output" || die "pdfunite failed"
+
+# ---------------------------------------------------- optional: keep parts --
+
+if (( keep )); then
+  integer kept=0
+  for p in $pdfs; do
+    # Recover the original document from the 0001_<name> prefix we assigned.
+    idx=${${p:t:r}%%_*}
+    orig=$docs[$((10#$idx))]
+    dest=${orig:r}.pdf
+    [[ -e $dest ]] && dest=${orig:r}.converted.pdf
+    if [[ -e $dest ]]; then
+      warn "not overwriting ${dest:t}; skipped"
+      continue
+    fi
+    cp -- "$p" "$dest" && (( ++kept ))
+  done
+  print -r -- "  kept $kept individual PDF(s) beside the source documents"
+fi
+
+print -r -- "  done: $output"

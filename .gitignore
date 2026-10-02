@@ -1,0 +1,4 @@
+.DS_Store
+
+# Output from running the tool against the test fixtures
+test/*.pdf
